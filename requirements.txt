@@ -4,5 +4,6 @@ matplotlib
 kagglehub
 streamlit
 opencv-python-headless
-mediapipe-silicon
+mediapipe
+pillow
 
