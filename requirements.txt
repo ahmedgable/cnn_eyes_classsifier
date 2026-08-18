@@ -1,9 +1,9 @@
+streamlit
 tensorflow>=2.15.0
 numpy
 matplotlib
 kagglehub
-streamlit
+pillow
 opencv-python-headless
 mediapipe
-pillow
 
