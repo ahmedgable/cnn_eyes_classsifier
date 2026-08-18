@@ -4,16 +4,11 @@ import tempfile
 import time
 import zipfile
 
-try:
-    import cv2
-except ImportError:
-    subprocess.run(["pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"])
-    subprocess.run(["pip", "install", "opencv-python-headless"])
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import mediapipe as mp
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
+
 IMG_SIZE = (64, 64)
 DEFAULT_MODEL_PATH = "saved_models/best_eye_model.keras"
 
@@ -106,8 +101,8 @@ def predict_eye(kind, model, eye_img_gray_64x64: np.ndarray) -> float:
         return float(out.reshape(-1)[0])
 
 
-def crop_eye_region(frame, landmarks, eye_indices, padding=10):
-    h, w, _ = frame.shape
+def crop_eye_region_pil(image: Image.Image, landmarks, eye_indices, padding=10):
+    w, h = image.size
     pts = [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in eye_indices]
     
     x_coords = [p[0] for p in pts]
@@ -119,13 +114,18 @@ def crop_eye_region(frame, landmarks, eye_indices, padding=10):
     if xmax <= xmin or ymax <= ymin:
         return None, None
 
-    eye_crop = frame[ymin:ymax, xmin:xmax]
+    # قص الجزء المطلوب من الصورة عبر PIL
+    eye_crop = image.crop((xmin, ymin, xmax, ymax))
     return eye_crop, (xmin, ymin, xmax - xmin, ymax - ymin)
 
 
-def annotate_frame_mediapipe(frame_bgr, kind, model, face_mesh, open_thresh: float):
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
+def annotate_frame_mediapipe_pil(pil_image: Image.Image, kind, model, face_mesh, open_thresh: float):
+    # تحويل الصورة إلى Numpy Array لتمريرها إلى MediaPipe
+    rgb_np = np.array(pil_image)
+    results = face_mesh.process(rgb_np)
+
+    annotated_image = pil_image.copy()
+    draw = ImageDraw.Draw(annotated_image)
 
     any_eye = False
     any_closed = False
@@ -135,29 +135,31 @@ def annotate_frame_mediapipe(frame_bgr, kind, model, face_mesh, open_thresh: flo
             landmarks = face_landmarks.landmark
 
             for eye_indices in [LEFT_EYE_INDICES, RIGHT_EYE_INDICES]:
-                eye_crop, bbox = crop_eye_region(frame_bgr, landmarks, eye_indices)
-                if eye_crop is None or eye_crop.size == 0:
+                eye_crop, bbox = crop_eye_region_pil(pil_image, landmarks, eye_indices)
+                if eye_crop is None:
                     continue
 
                 any_eye = True
-                gray_eye = cv2.cvtColor(eye_crop, cv2.COLOR_BGR2GRAY)
-                resized_eye = cv2.resize(gray_eye, IMG_SIZE)
 
-                prob_open = predict_eye(kind, model, resized_eye)
+                # تحويل العين المقصوصة إلى رمادي (Grayscale) وتغيير الحجم باستخدام Pillow
+                gray_eye = eye_crop.convert("L").resize(IMG_SIZE)
+                resized_eye_np = np.array(gray_eye)
+
+                prob_open = predict_eye(kind, model, resized_eye_np)
                 is_open = prob_open > open_thresh
 
                 if not is_open:
                     any_closed = True
 
-                label = "Open" if is_open else "Closed"
-                color = (0, 200, 0) if is_open else (0, 0, 255)
+                label = f"{'Open' if is_open else 'Closed'} ({prob_open:.2f})"
+                color = "green" if is_open else "red"
 
                 x, y, w_box, h_box = bbox
-                cv2.rectangle(frame_bgr, (x, y), (x + w_box, y + h_box), color, 2)
-                cv2.putText(frame_bgr, f"{label} ({prob_open:.2f})", (x, y - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                # رسم المربع والنص باستخدام PIL
+                draw.rectangle([x, y, x + w_box, y + h_box], outline=color, width=2)
+                draw.text((x, max(0, y - 12)), label, fill=color)
 
-    return frame_bgr, any_eye, any_closed
+    return annotated_image, any_eye, any_closed
 
 
 # ----------------------------------------------------------------------
@@ -170,7 +172,6 @@ with st.sidebar:
     st.header("Settings")
     model_path = st.text_input("Model path", value=DEFAULT_MODEL_PATH)
     open_thresh = st.slider("Open probability threshold", 0.0, 1.0, 0.5, 0.05)
-    closed_seconds_alert = st.slider("Drowsiness alert after (seconds closed)", 0.5, 5.0, 1.5, 0.5)
 
 if not os.path.exists(model_path):
     st.error(f"Model file not found: `{model_path}`. Update the path in the sidebar.")
@@ -179,58 +180,36 @@ if not os.path.exists(model_path):
 kind, model = load_model(model_path)
 st.success(f"Model loaded ({kind}) ✅")
 
-tab_live, tab_upload = st.tabs(["📷 Live Webcam", "🖼️ Upload Image"])
+tab_camera, tab_upload = st.tabs(["📷 Take Photo / Camera", "🖼️ Upload Image"])
 
 # ------------------------------------------------------------------
-# TAB 1: Live webcam feed
+# TAB 1: Camera Input
 # ------------------------------------------------------------------
-with tab_live:
-    st.write("Click **Start** to open your webcam and run real-time detection.")
-    run = st.toggle("Start webcam", value=False, key="run_webcam")
-    frame_placeholder = st.empty()
-    alert_placeholder = st.empty()
+with tab_camera:
+    st.write("Take a snapshot using your webcam to test the eye status.")
+    camera_file = st.camera_input("Take a picture")
 
-    if run:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Could not open webcam (index 0). Is it connected / not in use by another app?")
+    if camera_file is not None:
+        image = Image.open(camera_file).convert("RGB")
+
+        with mp_face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5
+        ) as face_mesh:
+            annotated, any_eye, any_closed = annotate_frame_mediapipe_pil(
+                image, kind, model, face_mesh, open_thresh
+            )
+
+        st.image(annotated, caption="Detection result", use_container_width=True)
+
+        if not any_eye:
+            st.warning("No eyes were detected. Please make sure your face is visible and well lit.")
+        elif any_closed:
+            st.error("🚨 At least one detected eye is Closed.")
         else:
-            closed_since = None
-            with mp_face_mesh.FaceMesh(
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            ) as face_mesh:
-                try:
-                    while st.session_state.get("run_webcam", False):
-                        ok, frame = cap.read()
-                        if not ok:
-                            st.warning("Failed to read frame from webcam.")
-                            break
-
-                        annotated, any_eye, any_closed = annotate_frame_mediapipe(
-                            frame, kind, model, face_mesh, open_thresh
-                        )
-
-                        if any_eye and any_closed:
-                            if closed_since is None:
-                                closed_since = time.time()
-                            elapsed = time.time() - closed_since
-                            if elapsed >= closed_seconds_alert:
-                                alert_placeholder.error("🚨 DROWSINESS ALERT!")
-                            else:
-                                alert_placeholder.empty()
-                        else:
-                            closed_since = None
-                            alert_placeholder.empty()
-
-                        frame_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                        frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-                finally:
-                    cap.release()
-    else:
-        frame_placeholder.info("Webcam is stopped. Toggle 'Start webcam' above to begin.")
+            st.success("✅ All detected eyes are Open.")
 
 # ------------------------------------------------------------------
 # TAB 2: Upload image
@@ -240,8 +219,7 @@ with tab_upload:
     uploaded = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp"])
 
     if uploaded is not None:
-        image = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        frame_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        image = Image.open(uploaded).convert("RGB")
 
         with mp_face_mesh.FaceMesh(
             static_image_mode=True,
@@ -249,16 +227,15 @@ with tab_upload:
             refine_landmarks=True,
             min_detection_confidence=0.5
         ) as face_mesh:
-            annotated, any_eye, any_closed = annotate_frame_mediapipe(
-                frame_bgr.copy(), kind, model, face_mesh, open_thresh
+            annotated, any_eye, any_closed = annotate_frame_mediapipe_pil(
+                image, kind, model, face_mesh, open_thresh
             )
 
-        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), caption="Detection result",
-                  use_container_width=True)
+        st.image(annotated, caption="Detection result", use_container_width=True)
 
         if not any_eye:
             st.warning("No eyes were detected in this image. Try a clearer, more frontal photo.")
         elif any_closed:
-            st.error("At least one detected eye is Closed.")
+            st.error("🚨 At least one detected eye is Closed.")
         else:
-            st.success("All detected eyes are Open.")
+            st.success("✅ All detected eyes are Open.")
