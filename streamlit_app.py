@@ -8,7 +8,6 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 import mediapipe as mp
-os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "0"
 IMG_SIZE = (64, 64)
 DEFAULT_MODEL_PATH = "saved_models/best_eye_model.keras"
 
